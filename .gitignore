@@ -19,3 +19,7 @@ __pycache__/
 # OS / Editor
 .DS_Store
 *.swp
+
+# Uploaded documents (Phase 3) — keep the directory, ignore its contents
+backend/uploads/*
+!backend/uploads/.gitkeep
