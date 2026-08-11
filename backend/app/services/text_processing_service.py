@@ -6,11 +6,13 @@ chunks using LangChain's RecursiveCharacterTextSplitter with the tiktoken
 """
 import re
 import logging
+from datetime import datetime, timezone
 
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 
@@ -143,4 +145,98 @@ def process_chunks(document_id, db: Session) -> int:
 
     db.commit()
     logger.info("Created %d chunks for document %s", len(chunks), document_id)
+
+    # Phase 5 & 6: automatically embed the chunks and index them in Qdrant.
+    try:
+        index_document_embeddings(document.id, db)
+    except Exception as exc:  # noqa: BLE001 — indexing must not fail chunking
+        logger.exception(
+            "Embedding/indexing failed for document %s: %s", document_id, exc
+        )
+
     return len(chunks)
+
+
+def index_document_embeddings(
+    document_id, db: Session, provider_name: str | None = None
+) -> int:
+    """Generate embeddings for a document's chunks and upsert them to Qdrant.
+
+    For each chunk this: (1) generates a vector via the configured embedding
+    provider, (2) upserts the vector + source payload into the Qdrant
+    collection, and (3) records an ``EmbeddingMetadata`` row (idempotent —
+    existing rows/vectors for the document are removed first). Returns the
+    number of vectors indexed.
+    """
+    # Imported here to avoid heavy imports at module load / circular imports.
+    from qdrant_client.http.models import PointStruct
+
+    from app.models.embedding_metadata import EmbeddingMetadata
+    from app.services.embedding_service import generate_embeddings_for_document
+    from app.services.vector_service import QdrantService
+
+    document = db.query(Document).filter(Document.id == document_id).first()
+    if document is None:
+        raise ValueError(f"Document {document_id} not found")
+
+    provider_name = provider_name or settings.DEFAULT_EMBEDDING_MODEL
+    collection = settings.QDRANT_COLLECTION
+
+    results, provider = generate_embeddings_for_document(
+        document_id, provider_name, db
+    )
+    if not results:
+        logger.warning("No embeddings generated for document %s", document_id)
+        return 0
+
+    dimension = provider.dimension or len(results[0][1])
+
+    qdrant = QdrantService()
+    qdrant.ensure_collection(collection, dimension)
+    # Idempotent re-indexing: clear prior vectors/metadata for this document.
+    qdrant.delete_document_vectors(collection, str(document.id))
+    db.query(EmbeddingMetadata).filter(
+        EmbeddingMetadata.document_id == document.id
+    ).delete(synchronize_session=False)
+
+    # Look up chunk_index per chunk for payloads.
+    chunk_index_by_id = {
+        c.id: c.chunk_index
+        for c in db.query(DocumentChunk)
+        .filter(DocumentChunk.document_id == document.id)
+        .all()
+    }
+
+    points = []
+    now = datetime.now(timezone.utc)
+    for chunk_id, vector, point_id in results:
+        payload = {
+            "document_id": str(document.id),
+            "chunk_id": str(chunk_id),
+            "chunk_index": chunk_index_by_id.get(chunk_id),
+            "filename": document.original_filename,
+            "document_type": document.document_type.value,
+        }
+        points.append(
+            PointStruct(id=str(point_id), vector=vector, payload=payload)
+        )
+        db.add(
+            EmbeddingMetadata(
+                chunk_id=chunk_id,
+                document_id=document.id,
+                embedding_model=provider.model_name,
+                embedding_dimension=dimension,
+                qdrant_point_id=point_id,
+                indexed_at=now,
+            )
+        )
+
+    qdrant.upsert_vectors(collection, points)
+    db.commit()
+    logger.info(
+        "Indexed %d vectors for document %s in collection '%s'",
+        len(points),
+        document_id,
+        collection,
+    )
+    return len(points)
