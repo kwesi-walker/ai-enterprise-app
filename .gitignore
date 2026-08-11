@@ -11,3 +11,11 @@ __pycache__/
 
 # Environment Variables
 .env
+.env.*
+# Keep example env files (documentation of required variables)
+!.env.example
+!backend/.env.example
+
+# OS / Editor
+.DS_Store
+*.swp
