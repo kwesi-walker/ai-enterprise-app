@@ -18,3 +18,9 @@ unstructured[pdf]==0.14.4
 langchain==0.2.6
 langchain-text-splitters==0.2.2
 tiktoken==0.7.0
+# Phase 5 — Embeddings
+sentence-transformers==3.0.1
+openai==1.35.7
+numpy==1.26.4
+# Phase 6 — Qdrant vector database
+qdrant-client==1.9.1
